@@ -1,30 +1,28 @@
 import os, json, re, math
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, Body, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from openai import OpenAI
 import httpx
 
-# --- env & client ---
+# ---------- Env & Client ----------
 load_dotenv()
-# Optional hardening (some hosts auto-set proxies that can confuse httpx):
+
+# (Optional) neutralize proxies that sometimes break httpx/OpenAI on hosts
 os.environ.pop("HTTP_PROXY", None)
 os.environ.pop("HTTPS_PROXY", None)
 os.environ.setdefault("NO_PROXY", "api.openai.com")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    # don't crash import on Render's build step; we raise at runtime instead
-    pass
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# --- app first (so decorators see it) ---
-app = FastAPI(title="ListingMatcher API", version="1.2.1")
+# ---------- FastAPI App ----------
+app = FastAPI(title="ListingMatcher API", version="1.2.2")
 
-# CORS (handy for Bubble/GHL previews)
+# CORS (handy for Bubble/GHL previews or browser calls)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -34,7 +32,7 @@ app.add_middleware(
 # ---------- Models ----------
 class FlatCriteria(BaseModel):
     location: str
-    budget: Optional[str] = None
+    budget: Optional[str] = None           # e.g., "300000-650000 CAD" or "<= 450000 CAD"
     beds: Optional[int] = None
     baths: Optional[float] = None
     keywords: Optional[str] = None
@@ -74,10 +72,15 @@ class MatchResponse(BaseModel):
 
 # ---------- Utilities ----------
 def normalize_to_flat(payload: dict) -> FlatCriteria:
-    """Accept flat shape or Bubble's {criteria:{...}} shape."""
+    """
+    Accepts either:
+      - flat {location,budget,beds,baths,keywords,limit,language,allow_web}
+      - nested {limit,language,allow_web, criteria:{location,min_price,max_price,beds_min,baths_min,property_types,keywords}}
+    Returns FlatCriteria.
+    """
     if "criteria" in payload and isinstance(payload["criteria"], dict):
         c = payload["criteria"]
-        # budget
+        # budget text
         if c.get("min_price") is not None and c.get("max_price") is not None:
             budget_text = f"{c['min_price']}-{c['max_price']} CAD"
         elif c.get("min_price") is not None:
@@ -104,7 +107,9 @@ def normalize_to_flat(payload: dict) -> FlatCriteria:
     return FlatCriteria(**payload)
 
 async def tool_web_search(query: str, num: int = 5) -> Dict[str, Any]:
-    """Search via serper.dev if SERPER_API_KEY is set; else return a hint."""
+    """
+    Searches with serper.dev if SERPER_API_KEY is set. Otherwise returns a hint.
+    """
     serper = os.getenv("SERPER_API_KEY")
     if serper:
         try:
@@ -121,12 +126,7 @@ async def tool_web_search(query: str, num: int = 5) -> Dict[str, Any]:
             return {"engine": "serper", "query": query, "results": items}
         except Exception as e:
             return {"engine": "serper", "query": query, "results": [], "error": str(e)}
-    return {
-        "engine": "fallback",
-        "query": query,
-        "results": [],
-        "note": "No SERPER_API_KEY set; provide explicit URLs to fetch with http_get."
-    }
+    return {"engine": "fallback", "query": query, "results": [], "note": "No SERPER_API_KEY set; provide explicit URLs to fetch with http_get."}
 
 async def tool_http_get(url: str, max_chars: int = 20000) -> Dict[str, Any]:
     try:
@@ -166,6 +166,7 @@ def extract_text(api_resp) -> str:
         return ""
 
 def extract_tool_calls(api_resp):
+    """Find tool/function calls in Responses output."""
     calls = []
     for item in (getattr(api_resp, "output", None) or []):
         obj = item if isinstance(item, dict) else item.__dict__
@@ -201,7 +202,7 @@ async def run_listingmatcher(request: Request):
         "For MLS extraction:\n"
         "- Centris QC: often 7 digits, e.g., 1234567 (use \\b\\d{7}\\b).\n"
         "- REALTOR.ca: can be alphanumeric/hyphen, use \\b[A-Z0-9-]{6,12}\\b.\n"
-        "If MLS not on page, set mls:null."
+        "If MLS not on page, set mls:null (do not guess)."
     )
 
     system_instructions = (
@@ -210,7 +211,8 @@ async def run_listingmatcher(request: Request):
         "- Output 5–12 results, deduplicate by MLS.\n"
         "- Fields: mls, url, address, price_cad, beds, baths, type, note (one-line).\n"
         f"- {mls_hint}\n"
-        "- ALWAYS return a machine-readable JSON array named 'properties' at the end."
+        "- When tools are available, you may search and open pages to verify MLS and details.\n"
+        "- ALWAYS end with a machine-readable JSON array named 'properties'."
     )
 
     user_block = (
@@ -221,11 +223,11 @@ async def run_listingmatcher(request: Request):
         f"Keywords: {flat.keywords or 'N/A'}\n"
         f"Limit: {flat.limit}\n"
         f"{language_line}\n"
-        "If tools are available, you may search with site filters like 'site:centris.ca' or 'site:realtor.ca', then open promising URLs and extract MLS/address/price from page content. "
+        "If you use tools, search with site filters like 'site:centris.ca' or 'site:realtor.ca', then open promising URLs and extract MLS/address/price from page content. "
         "Return a concise human summary PLUS a JSON array named 'properties'."
     )
 
-    # tools (only if allowed)
+    # tools offered to the model (only if allowed)
     tool_defs = []
     if flat.allow_web:
         tool_defs = [
@@ -235,7 +237,10 @@ async def run_listingmatcher(request: Request):
                 "description": "Web search for listings (centris, realtor.ca, remax-quebec, royallepage, duproprio).",
                 "parameters": {
                     "type": "object",
-                    "properties": {"query": {"type": "string"}, "num": {"type": "integer"}},
+                    "properties": {
+                        "query": {"type": "string"},
+                        "num": {"type": "integer", "minimum": 1, "maximum": 10}
+                    },
                     "required": ["query"]
                 }
             },
@@ -256,52 +261,63 @@ async def run_listingmatcher(request: Request):
         {"role": "user", "content": user_block},
     ]
 
+    def run_once(msgs):
+        return client.responses.create(
+            model="gpt-4.1",
+            input=msgs,
+            tools=tool_defs or None
+        )
+
     text = ""
     last_raw = None
-    for _ in range(3):  # up to 3 tool iterations
+
+    # ---- Tool loop (max 3 rounds) ----
+    for _ in range(3):
         try:
-            api_resp = client.responses.create(
-                model="gpt-4.1",
-                input=messages,
-                tools=tool_defs or None
-            )
+            api_resp = run_once(messages)
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"OpenAI error: {e}")
 
         last_raw = api_resp
         tool_calls = extract_tool_calls(api_resp)
 
+        # If no tool calls, collect any text and break
         if not tool_calls:
             text = extract_text(api_resp) or text
             break
 
-        # execute tool calls
-        tool_results_blocks = []
+        # Execute each tool call and append a separate role="tool" message with tool_call_id
         for i, call in enumerate(tool_calls):
+            call_id = call.get("id") or call.get("tool_call_id") or str(i)
             name = call.get("tool_name") or call.get("name")
             args = call.get("arguments") or {}
             if isinstance(args, str):
-                try: args = json.loads(args)
-                except: args = {}
-            if name == "web_search":
-                out = await tool_web_search(args.get("query",""), int(args.get("num",5) or 5))
-                tool_results_blocks.append({"call_id": str(i), "output": json.dumps(out)})
-            elif name == "http_get":
-                out = await tool_http_get(args.get("url",""))
-                tool_results_blocks.append({"call_id": str(i), "output": json.dumps(out)})
-            else:
-                tool_results_blocks.append({"call_id": str(i), "output": json.dumps({"error":"unknown tool"})})
+                try:
+                    args = json.loads(args)
+                except:
+                    args = {}
 
-        # feed tool results back
-        messages.append({
-            "role": "assistant",
-            "content": [{"type":"tool_result","tool_results": tool_results_blocks}]
-        })
+            if name == "web_search":
+                out = await tool_web_search(args.get("query", ""), int(args.get("num", 5) or 5))
+                output_text = json.dumps(out)
+            elif name == "http_get":
+                out = await tool_http_get(args.get("url", ""))
+                output_text = json.dumps(out)
+            else:
+                output_text = json.dumps({"error": f"unknown tool: {name}"})
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": str(call_id),
+                "content": [
+                    {"type": "output_text", "text": output_text}
+                ]
+            })
 
     if not text and last_raw:
         text = extract_text(last_raw)
 
-    # Extract JSON array "properties"
+    # ---- Extract JSON array "properties" from the model's text ----
     props = []
     try:
         m = re.search(r'"properties"\s*:\s*(\[[\s\S]*?\])', text or "")
