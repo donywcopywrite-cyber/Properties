@@ -1,9 +1,9 @@
-import os, json, re, math
+import os, json, re, math, time
 from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import OpenAI
 import httpx
@@ -11,7 +11,7 @@ import httpx
 # ---------- Env & Client ----------
 load_dotenv()
 
-# (Optional) neutralize proxies that sometimes break httpx/OpenAI on hosts
+# (Optional) neutralize proxies that can interfere with httpx/OpenAI on some hosts
 os.environ.pop("HTTP_PROXY", None)
 os.environ.pop("HTTPS_PROXY", None)
 os.environ.setdefault("NO_PROXY", "api.openai.com")
@@ -20,7 +20,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ---------- FastAPI App ----------
-app = FastAPI(title="ListingMatcher API", version="1.2.2")
+app = FastAPI(title="ListingMatcher API", version="1.3.0")
 
 # CORS (handy for Bubble/GHL previews or browser calls)
 app.add_middleware(
@@ -70,7 +70,7 @@ class MatchResponse(BaseModel):
     reply: str
     properties: List[Listing] = []
 
-# ---------- Utilities ----------
+# ---------- Helpers ----------
 def normalize_to_flat(payload: dict) -> FlatCriteria:
     """
     Accepts either:
@@ -142,7 +142,7 @@ async def tool_http_get(url: str, max_chars: int = 20000) -> Dict[str, Any]:
         return {"status": 0, "url": url, "error": str(e)}
 
 def extract_text(api_resp) -> str:
-    """Robustly gather assistant text from Responses API output."""
+    """Gather assistant text from Responses API output."""
     try:
         if getattr(api_resp, "output_text", None):
             return api_resp.output_text
@@ -171,7 +171,12 @@ def extract_tool_calls(api_resp):
     for item in (getattr(api_resp, "output", None) or []):
         obj = item if isinstance(item, dict) else item.__dict__
         if obj.get("type") in ("tool_call", "function_call"):
-            calls.append(obj)
+            # normalize
+            calls.append({
+                "id": obj.get("id") or obj.get("tool_call_id"),
+                "name": obj.get("tool_name") or obj.get("name"),
+                "arguments": obj.get("arguments"),
+            })
     return calls
 
 # ---------- Routes ----------
@@ -181,7 +186,7 @@ def health():
 
 @app.post("/listingmatcher/run", response_model=MatchResponse)
 async def run_listingmatcher(request: Request):
-    if not os.getenv("OPENAI_API_KEY"):
+    if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="Server misconfigured: OPENAI_API_KEY missing")
 
     try:
@@ -256,68 +261,57 @@ async def run_listingmatcher(request: Request):
             }
         ]
 
-    messages = [
-        {"role": "system", "content": system_instructions},
-        {"role": "user", "content": user_block},
-    ]
-
-    def run_once(msgs):
-        return client.responses.create(
+    # ---- Create initial response ----
+    try:
+        resp = client.responses.create(
             model="gpt-4.1",
-            input=msgs,
-            tools=tool_defs or None
+            input=[
+                {"role": "system", "content": [{"type":"input_text", "text": system_instructions}]},
+                {"role": "user",   "content": [{"type":"input_text", "text": user_block}]},
+            ],
+            tools=tool_defs or None,
         )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"OpenAI error: {e}")
 
-    text = ""
-    last_raw = None
-
-    # ---- Tool loop (max 3 rounds) ----
-    for _ in range(3):
-        try:
-            api_resp = run_once(messages)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"OpenAI error: {e}")
-
-        last_raw = api_resp
-        tool_calls = extract_tool_calls(api_resp)
-
-        # If no tool calls, collect any text and break
+    # ---- Tool loop: run tools, then submit outputs, until completed ----
+    for _ in range(4):  # up to 4 rounds of tool usage
+        tool_calls = extract_tool_calls(resp)
         if not tool_calls:
-            text = extract_text(api_resp) or text
             break
 
-        # Execute each tool call and append a separate role="tool" message with tool_call_id
-        for i, call in enumerate(tool_calls):
-            call_id = call.get("id") or call.get("tool_call_id") or str(i)
-            name = call.get("tool_name") or call.get("name")
-            args = call.get("arguments") or {}
+        tool_outputs = []
+        for tc in tool_calls:
+            name = tc.get("name")
+            tc_id = tc.get("id") or ""
+            args = tc.get("arguments") or {}
             if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except:
-                    args = {}
+                try: args = json.loads(args)
+                except: args = {}
 
             if name == "web_search":
-                out = await tool_web_search(args.get("query", ""), int(args.get("num", 5) or 5))
-                output_text = json.dumps(out)
+                out = await tool_web_search(args.get("query",""), int(args.get("num",5) or 5))
+                tool_outputs.append({"tool_call_id": tc_id, "output": json.dumps(out)})
             elif name == "http_get":
-                out = await tool_http_get(args.get("url", ""))
-                output_text = json.dumps(out)
+                out = await tool_http_get(args.get("url",""))
+                tool_outputs.append({"tool_call_id": tc_id, "output": json.dumps(out)})
             else:
-                output_text = json.dumps({"error": f"unknown tool: {name}"})
+                tool_outputs.append({"tool_call_id": tc_id, "output": json.dumps({"error": f"unknown tool: {name}"})})
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": str(call_id),
-                "content": [
-                    {"type": "output_text", "text": output_text}
-                ]
-            })
+        try:
+            resp = client.responses.submit_tool_outputs(
+                response_id=resp.id,
+                tool_outputs=tool_outputs,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"OpenAI tool submit error: {e}")
 
-    if not text and last_raw:
-        text = extract_text(last_raw)
+        # optional small wait if the provider is asynchronous
+        if getattr(resp, "status", "") not in ("completed", "incomplete"):
+            time.sleep(0.15)
 
-    # ---- Extract JSON array "properties" from the model's text ----
+    # ---- Finalize: get text + extract "properties" JSON ----
+    text = extract_text(resp) or ""
     props = []
     try:
         m = re.search(r'"properties"\s*:\s*(\[[\s\S]*?\])', text or "")
